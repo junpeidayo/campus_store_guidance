@@ -103,12 +103,19 @@ export default function Map() {
             scaledSize: new google.maps.Size(36, 36),
             anchor: new google.maps.Point(18, 36),
           };
+
           return (
             <Marker
               key={store.id}
               position={{ lat: store.lat, lng: store.lng }}
               title={store.name}
               icon={icon}
+              label={{
+                text: store.name,
+                color: "black",
+                fontSize: "12px",
+                fontWeight: "bold",
+              }}
             />
           );
         })}
