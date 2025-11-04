@@ -1,3 +1,4 @@
+// Map.tsx
 import {
   GoogleMap,
   useLoadScript,
@@ -5,7 +6,7 @@ import {
   DirectionsRenderer,
   OverlayView,
 } from "@react-google-maps/api";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 
 type Store = {
   id: string;
@@ -21,6 +22,16 @@ const iconMap: Record<Store["type"], string> = {
   vending: "/icons/vending.png",
   shop: "/icons/konbini.jpg",
   drink: "/icons/jihan.jpg",
+};
+
+// ★ フロントの store.id → DBの facility_id の対応（必ず実データに合わせて！）
+const FACILITY_ID_MAP: Record<
+  string,
+  { dbId?: string; year: number; month: number }
+> = {
+  // id "2": 生協コンビニ → DB側 facility_id を「coop-mare」に変更
+  "2": { dbId: "coop-mare", year: 2025, month: 11 },
+  // 他にもDBへ保存した施設があればここに追加
 };
 
 export default function Map() {
@@ -86,14 +97,53 @@ export default function Map() {
     "all"
   );
 
+  // 営業状態 { [store.id]: { isOpen, hours } }
+  const [openStatus, setOpenStatus] = useState<
+    Record<string, { isOpen: boolean; hours: string }>
+  >({});
+
+  // 起動時に shop だけ /api/open-check を叩いて営業状態を取得
+  useEffect(() => {
+    const targets = stores.filter(
+      (s) => s.type === "shop" && FACILITY_ID_MAP[s.id]?.dbId
+    );
+    if (targets.length === 0) return;
+
+    (async () => {
+      try {
+        const results = await Promise.all(
+          targets.map(async (s) => {
+            const meta = FACILITY_ID_MAP[s.id]!;
+            const params = new URLSearchParams({
+              facilityId: meta.dbId!, // 例: coop-mare
+              year: String(meta.year), // 例: 2025
+              month: String(meta.month), // 例: 11
+            });
+            // ← Viteのproxyを使うので /api でOK（vite.config.ts の target は http://localhost:3005 に）
+            const res = await fetch(`/api/open-check?${params.toString()}`);
+            const json = await res.json();
+            return {
+              id: s.id,
+              isOpen: Boolean(json.isOpen),
+              hours: (json.hours as string) || "-",
+            };
+          })
+        );
+
+        const next: Record<string, { isOpen: boolean; hours: string }> = {};
+        results.forEach(
+          (r) => (next[r.id] = { isOpen: r.isOpen, hours: r.hours })
+        );
+        setOpenStatus(next);
+      } catch (err) {
+        console.error("open-check 取得失敗:", err);
+      }
+    })();
+  }, [stores]);
+
   const getIcon = (type: Store["type"]) => {
     let size = new google.maps.Size(36, 36);
-
-    // 自販機だけ大きくする
-    if (type === "drink") {
-      size = new google.maps.Size(80, 80);
-    }
-
+    if (type === "drink") size = new google.maps.Size(80, 80); // 自販機のみ大きく
     return {
       url: iconMap[type],
       scaledSize: size,
@@ -105,10 +155,10 @@ export default function Map() {
     if (!google || !google.maps) return;
     const directionsService = new google.maps.DirectionsService();
 
-    const filteredStores =
+    const filtered =
       filter === "all" ? stores : stores.filter((s) => s.type === filter);
 
-    const promises = filteredStores.map(
+    const promises = filtered.map(
       (store) =>
         new Promise<{
           store: Store;
@@ -120,7 +170,6 @@ export default function Map() {
             destination: { lat: store.lat, lng: store.lng },
             travelMode: google.maps.TravelMode.WALKING,
           };
-
           directionsService.route(request, (result, status) => {
             if (status === "OK" && result) {
               const leg = result.routes[0].legs[0];
@@ -129,9 +178,7 @@ export default function Map() {
                 distance: leg.distance?.text ?? "不明",
                 duration: leg.duration?.text ?? "不明",
               });
-            } else {
-              resolve(null);
-            }
+            } else resolve(null);
           });
         })
     );
@@ -140,6 +187,7 @@ export default function Map() {
       const valid = results.filter(
         (r): r is NonNullable<typeof r> => r !== null
       );
+      // TODO: 「m」「km」混在なら単位変換してから比較
       valid.sort((a, b) => parseFloat(a.distance) - parseFloat(b.distance));
       setSortedStores(valid);
 
@@ -152,9 +200,7 @@ export default function Map() {
           travelMode: google.maps.TravelMode.WALKING,
         };
         directionsService.route(request, (result, status) => {
-          if (status === "OK" && result) {
-            setDirectionsResponse(result);
-          }
+          if (status === "OK" && result) setDirectionsResponse(result);
         });
       }
 
@@ -164,8 +210,19 @@ export default function Map() {
 
   if (!isLoaded) return <div>地図を読み込み中...</div>;
 
+  // UIフィルタ
   const filteredStores =
     filter === "all" ? stores : stores.filter((s) => s.type === filter);
+
+  // ★ 営業時間外の「shop」は非表示（自販機・自動販売系は常に表示）
+  const visibleStores = filteredStores.filter((s) => {
+    if (s.type !== "shop") return true;
+    const st = openStatus[s.id];
+    // 取得前は一旦表示したい→true / 取得前も隠したい→false に変更可
+    if (!st) return true;
+    return st.isOpen;
+  });
+  const visibleIds = new Set(visibleStores.map((s) => s.id));
 
   return (
     <div style={{ display: "flex", gap: "20px", width: "100%" }}>
@@ -189,16 +246,22 @@ export default function Map() {
             <option value="all">すべて表示</option>
             <option value="shop">購買施設のみ</option>
             <option value="drink">自販機のみ</option>
+            {/* vending を使うなら <option value="vending">…</option> を追加 */}
           </select>
         </div>
 
         <GoogleMap mapContainerStyle={containerStyle} center={origin} zoom={16}>
           <Marker position={origin} label="出発地" />
-          {filteredStores.map((store) => (
+
+          {visibleStores.map((store) => (
             <div key={store.id}>
               <Marker
                 position={{ lat: store.lat, lng: store.lng }}
-                title={store.name}
+                title={
+                  store.type === "shop" && openStatus[store.id]
+                    ? `${store.name}（営業時間: ${openStatus[store.id].hours}）`
+                    : store.name
+                }
                 icon={getIcon(store.type)}
               />
               {showLabels && (
@@ -214,14 +277,38 @@ export default function Map() {
                       backgroundColor: "transparent",
                       whiteSpace: "nowrap",
                       transform: "translate(-50%, -100%)",
+                      display: "flex",
+                      gap: 6,
                     }}
                   >
                     {store.name}
+                    {store.type === "shop" && openStatus[store.id] && (
+                      <span
+                        style={{
+                          fontSize: 11,
+                          padding: "2px 6px",
+                          borderRadius: 8,
+                          background: openStatus[store.id].isOpen
+                            ? "#e6ffec"
+                            : "#fff1f0",
+                          border: `1px solid ${
+                            openStatus[store.id].isOpen ? "#95de64" : "#ff7875"
+                          }`,
+                          color: openStatus[store.id].isOpen
+                            ? "#389e0d"
+                            : "#d4380d",
+                        }}
+                      >
+                        {openStatus[store.id].isOpen ? "営業中" : "営業時間外"}{" "}
+                        / {openStatus[store.id].hours}
+                      </span>
+                    )}
                   </div>
                 </OverlayView>
               )}
             </div>
           ))}
+
           {directionsResponse && (
             <DirectionsRenderer directions={directionsResponse} />
           )}
@@ -254,28 +341,34 @@ export default function Map() {
             paddingBottom: "4px",
           }}
         >
-          距離順（{filter === "all" ? "すべて" : filter}）
+          距離順（{filter === "all" ? "" : filter}）
         </h3>
         <ul style={{ listStyle: "none", padding: 0, marginTop: "12px" }}>
-          {sortedStores.map((s) => (
-            <li
-              key={s.store.id}
-              style={{
-                backgroundColor:
-                  s.store.id === nearestId ? "#eaf4ff" : "#f9f9f9",
-                border: "1px solid #ddd",
-                borderRadius: "8px",
-                padding: "10px 12px",
-                marginBottom: "10px",
-                boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
-              }}
-            >
-              <strong style={{ color: "#1E90FF" }}>{s.store.name}</strong>
-              <div style={{ fontSize: "14px", color: "#555" }}>
-                距離: {s.distance}・時間: {s.duration}
-              </div>
-            </li>
-          ))}
+          {sortedStores
+            // 地図の可視判定と同期
+            .filter((s) => visibleIds.has(s.store.id))
+            .map((s) => (
+              <li
+                key={s.store.id}
+                style={{
+                  backgroundColor:
+                    s.store.id === nearestId ? "#eaf4ff" : "#f9f9f9",
+                  border: "1px solid #ddd",
+                  borderRadius: "8px",
+                  padding: "10px 12px",
+                  marginBottom: "10px",
+                  boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
+                }}
+              >
+                <strong style={{ color: "#1E90FF" }}>{s.store.name}</strong>
+                <div style={{ fontSize: "14px", color: "#555" }}>
+                  距離: {s.distance}・時間: {s.duration}
+                  {openStatus[s.store.id]?.hours && (
+                    <div>営業時間: {openStatus[s.store.id].hours}</div>
+                  )}
+                </div>
+              </li>
+            ))}
         </ul>
       </div>
     </div>
